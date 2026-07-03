@@ -896,13 +896,29 @@ proc parseFile*(thisfile, outfile: string; portablePaths, depsEnabled, depsOnly:
     var conf = createConf()
     let fileIdx = fileInfoIdx(conf, AbsoluteFile thisfile)
     var parser: Parser = default(Parser)
-    syntaxes.openParser(parser, fileIdx, stream, newIdentCache(), conf)
+    let identCache = newIdentCache()
+    syntaxes.openParser(parser, fileIdx, stream, identCache, conf)
     bench "parseAll":
-      let fullTree = parseAll(parser)
+      var fullTree = parseAll(parser)
 
     if conf.errorCounter > 0:
       closeParser(parser)
       quit QuitFailure
+
+    # aoughwl: a `.aowl` module implicitly imports `aoughwl`, the way a `.nim`
+    # module implicitly imports `system`. We inject it at parse time so the
+    # dependency graph, sem, and body emission all treat it as a normal import.
+    if thisfile.len >= 5 and thisfile[thisfile.len - 5 .. ^1] == ".aowl":
+      let info = fullTree.info
+      var imp = newNodeI(nkImportStmt, info)
+      imp.add newIdentNode(identCache.getIdent("aoughwl"), info)
+      if fullTree.kind == nkStmtList:
+        fullTree.sons.insert(imp, 0)
+      else:
+        var wrap = newNodeI(nkStmtList, info)
+        wrap.add imp
+        wrap.add fullTree
+        fullTree = wrap
 
     var tc = initTranslationContext(conf, outfile, portablePaths, depsEnabled, depsOnly, preserveDocs)
 
