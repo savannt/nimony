@@ -10,7 +10,9 @@ include ".." / lib / nifprelude
 include ".." / lib / compat2
 
 import nimony_model, decls, programs, semdata, typeprops, xints, builtintypes, renderer, asthelpers,
-  features, symtabs, sigconcepts
+  features, symtabs, sigconcepts, conceptdfa
+when defined(conceptDfaCheck):
+  import conceptcache   # shadow-validation counters (dfa*)
 import ".." / lib / symparser
 import ".." / models / tags
 
@@ -710,6 +712,10 @@ proc conceptRoutineAvailableCore(m: var Match; conceptSym: SymId; body: Cursor; 
     m.inferred[selfSym] = a
   let basename = conceptRoutineBasename(routine)
   let inferenceBase = m.inferred
+  # Precompile this requirement's structural pattern once (cached by reqSym);
+  # each candidate is matched against it before the expensive full matcher.
+  let reqSym = conceptRequirementSym(routine)
+  let compiled = getOrCompileReq(m.context, reqSym, routine, selfSyms)
   for cand in collectConceptRoutineCandidates(m.context, conceptSym, basename):
     let res = tryLoadSym(cand)
     if res.status != LacksNothing:
@@ -719,11 +725,27 @@ proc conceptRoutineAvailableCore(m: var Match; conceptSym: SymId; body: Cursor; 
     m.inferred = inferenceBase
     for selfSym in selfSyms:
       m.inferred[selfSym] = a
+    let dfaMaybe = mayMatchCompiled(compiled, res.decl, a)
+    when not defined(conceptDfaCheck):
+      # THE GATE: a definite structural mismatch cannot possibly satisfy the
+      # requirement, so skip the full matcher. `-d:conceptDfaGateOff` disables
+      # this for A/B timing; `-d:conceptDfaCheck` disables it so the shadow
+      # validator can compare every candidate.
+      when not defined(conceptDfaGateOff):
+        if not dfaMaybe:
+          continue
     let oldErr = m.err
     let oldHasError = m.hasError
     m.err = false
     m.hasError = false
     let sigMatch = matchConceptRoutineSig(m, routine, res.decl)
+    when defined(conceptDfaCheck):
+      # Read-only shadow check: the pre-filter must never reject a real accept.
+      inc dfaTotalCands
+      if not dfaMaybe: inc dfaRejected
+      if sigMatch:
+        inc dfaRealAccepts
+        if not dfaMaybe: inc dfaFalseNegatives   # invariant violation: must stay 0
     m.err = oldErr
     m.hasError = oldHasError
     if sigMatch:

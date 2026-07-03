@@ -46,6 +46,14 @@ type
   ConceptMetadata* = object
     parents*: seq[SymId]
 
+  CompiledReq* = ref object
+    ## Precompiled structural pattern for one concept requirement, built by
+    ## `conceptdfa` and cached by requirement `SymId`. `paramTypes` are owned
+    ## copies so the pattern outlives the transient sem buffers.
+    kind*: SymKind
+    paramTypes*: seq[TokenBuf]
+    selfSyms*: seq[SymId]
+
   ConceptCacheImpl* = ref object of RootObj
     capacity*: int
     bodyCache*: Table[BodyCacheKey, ConceptBodyResult]
@@ -55,27 +63,36 @@ type
     candidatesCache*: Table[CandidatesCacheKey, seq[SymId]]
     candidatesCacheOrder*: seq[CandidatesCacheKey]
     metadata*: Table[SymId, ConceptMetadata]
+    compiledReqs*: Table[SymId, CompiledReq]
 
 var fallbackConceptCache = ConceptCacheImpl(capacity: DefaultConceptCacheCapacity)
 
 when defined(nimonyProfileConcepts):
   var
-    conceptBodyChecks* = 0
-    conceptBodyCacheHits* = 0
-    conceptRoutineAvailableCalls* = 0
-    conceptRoutineImplCacheHits* = 0
-    conceptCandidateScans* = 0
-    conceptCandidateCacheHits* = 0
-    matchConceptRoutineSigCalls* = 0
+    conceptBodyChecksCtr* = 0
+    conceptBodyCacheHitsCtr* = 0
+    conceptRoutineAvailableCallsCtr* = 0
+    conceptRoutineImplCacheHitsCtr* = 0
+    conceptCandidateScansCtr* = 0
+    conceptCandidateCacheHitsCtr* = 0
+    matchConceptRoutineSigCallsCtr* = 0
+
+  template conceptBodyChecks*() = inc conceptBodyChecksCtr
+  template conceptBodyCacheHits*() = inc conceptBodyCacheHitsCtr
+  template conceptRoutineAvailableCalls*() = inc conceptRoutineAvailableCallsCtr
+  template conceptRoutineImplCacheHits*() = inc conceptRoutineImplCacheHitsCtr
+  template conceptCandidateScans*() = inc conceptCandidateScansCtr
+  template conceptCandidateCacheHits*() = inc conceptCandidateCacheHitsCtr
+  template matchConceptRoutineSigCalls*() = inc matchConceptRoutineSigCallsCtr
 
   proc printConceptProfile*() =
     echo "concept profile:"
-    echo "  body_checks=", conceptBodyChecks, " body_cache_hits=", conceptBodyCacheHits
-    echo "  routine_available=", conceptRoutineAvailableCalls,
-         " routine_impl_hits=", conceptRoutineImplCacheHits
-    echo "  candidate_scans=", conceptCandidateScans,
-         " candidate_cache_hits=", conceptCandidateCacheHits
-    echo "  sig_match_calls=", matchConceptRoutineSigCalls
+    echo "  body_checks=", conceptBodyChecksCtr, " body_cache_hits=", conceptBodyCacheHitsCtr
+    echo "  routine_available=", conceptRoutineAvailableCallsCtr,
+         " routine_impl_hits=", conceptRoutineImplCacheHitsCtr
+    echo "  candidate_scans=", conceptCandidateScansCtr,
+         " candidate_cache_hits=", conceptCandidateCacheHitsCtr
+    echo "  sig_match_calls=", matchConceptRoutineSigCallsCtr
 else:
   template conceptBodyChecks*() = discard
   template conceptBodyCacheHits*() = discard
@@ -85,6 +102,24 @@ else:
   template conceptCandidateCacheHits*() = discard
   template matchConceptRoutineSigCalls*() = discard
   template printConceptProfile*() = discard
+
+when defined(conceptDfaCheck):
+  ## Shadow-validation counters for the `conceptdfa` structural pre-filter. The
+  ## pre-filter must never reject a candidate the real matcher accepts
+  ## (`dfaFalseNegatives` MUST stay 0); `dfaRejected` is the skippable work.
+  var
+    dfaTotalCands* = 0
+    dfaRejected* = 0
+    dfaRealAccepts* = 0
+    dfaFalseNegatives* = 0
+
+  proc printConceptDfaCheck*() =
+    echo "conceptdfa check: cands=", dfaTotalCands,
+         " dfa_rejected=", dfaRejected,
+         " real_accepts=", dfaRealAccepts,
+         " FALSE_NEGATIVES=", dfaFalseNegatives
+else:
+  template printConceptDfaCheck*() = discard
 
 proc `==`*(a, b: ConceptTypeKey): bool {.inline, noSideEffect.} =
   a.root == b.root and a.aux == b.aux
@@ -137,6 +172,7 @@ proc onConceptImportsChanged*(c: var SemContext) =
   cache.routineImplCacheOrder.setLen(0)
   cache.candidatesCache.clear()
   cache.candidatesCacheOrder.setLen(0)
+  cache.compiledReqs.clear()
 
 proc invalidateConceptSymCache(cache: ConceptCacheImpl; conceptSym: SymId) =
   block body:
@@ -184,6 +220,9 @@ proc onConceptDeclSem*(c: var SemContext; ownerSym: SymId; dest: var TokenBuf; c
     return
   let cache = asConceptCacheImpl(c.conceptCache)
   invalidateConceptSymCache(cache, ownerSym)
+  # A concept (re)declaration can change requirement signatures; drop precompiled
+  # patterns so `conceptdfa` rebuilds them lazily.
+  cache.compiledReqs.clear()
   let body = cursorAt(dest, conceptStart)
   let parents = conceptParentsSlot(body)
   if conceptParentsWellFormed(parents):
@@ -191,6 +230,19 @@ proc onConceptDeclSem*(c: var SemContext; ownerSym: SymId; dest: var TokenBuf; c
     for p in conceptParentSyms(parents):
       meta.parents.add p
     cache.metadata[ownerSym] = meta
+
+proc getCompiledReq*(c: ptr SemContext; reqSym: SymId): CompiledReq =
+  ## Cached precompiled pattern for a requirement, or nil if not yet built.
+  if c == nil or reqSym == SymId(0):
+    return nil
+  let cache = ensureConceptCache(c)
+  cache.compiledReqs.getOrDefault(reqSym)
+
+proc putCompiledReq*(c: ptr SemContext; reqSym: SymId; r: CompiledReq) =
+  if c == nil or reqSym == SymId(0) or r == nil:
+    return
+  let cache = ensureConceptCache(c)
+  cache.compiledReqs[reqSym] = r
 
 proc hashTypeCursor(n: Cursor): Hash =
   var h: Hash = 0
