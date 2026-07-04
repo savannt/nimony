@@ -127,11 +127,23 @@ proc resolveFile*(paths: openArray[string]; origin: string; toResolve: string): 
     else:
       result = val / nimFile.substr(i)
   else:
-    result = splitFile(origin).dir / nimFile
-    var i = 0
-    while not os.fileExists(result) and i < paths.len:
-      result = paths[i] / nimFile
-      inc i
+    # aoughwl: a module file may be `.nim` or `.aowl` — search for whichever
+    # exists, preferring `.nim` for backward compatibility.
+    const moduleExts = [".nim", ".aowl"]
+    let dir = splitFile(origin).dir
+    result = dir / nimFile
+    block search:
+      for e in moduleExts:
+        let cand = dir / toResolve.addFileExt(e)
+        if os.fileExists(cand):
+          result = cand
+          break search
+      for p in paths:
+        for e in moduleExts:
+          let cand = p / toResolve.addFileExt(e)
+          if os.fileExists(cand):
+            result = cand
+            break search
 
 type
   ImportedFilename* = object
