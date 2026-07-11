@@ -112,7 +112,7 @@ proc typeofCallIs(c: var SemContext; dest: var TokenBuf; it: var Item; beforeCal
   commonType c, dest, it, beforeCall, expected
 
 proc semTemplateCall(c: var SemContext; dest: var TokenBuf; it: var Item; fnId: SymId; beforeCall: int;
-                     m: Match) =
+                     m: Match; flags: set[SemFlag]) =
   var expandedInto = createTokenBuf(30)
 
   # If we are about to expand a template whose published body is still
@@ -121,8 +121,10 @@ proc semTemplateCall(c: var SemContext; dest: var TokenBuf; it: var Item; fnId: 
   # `expandTemplateImpl`'s SymId-keyed substitution can find the params.
   # See `tryPromoteTemplateBody` for why this must be lazy rather than
   # eager. Must run before `declToCursor` reads the decl into the local
-  # `res` since promotion swaps the registry buffer out.
-  discard tryPromoteTemplateBody(c, fnId)
+  # `res` since promotion swaps the registry buffer out. Routed through the
+  # unified on-demand driver `loadSymWithPhase` (the promotion is its only
+  # registered driver today).
+  discard loadSymWithPhase(c, fnId, SemcheckBodies)
 
   let s = fetchSym(c, fnId)
   let res = declToCursor(c, dest, s)
@@ -142,7 +144,7 @@ proc semTemplateCall(c: var SemContext; dest: var TokenBuf; it: var Item; fnId: 
     var a = Item(n: cursorAt(expandedInto, 0), typ: c.types.autoType)
     let aInfo = a.n.info
     inc c.routine.inInst
-    semExpr c, dest, a
+    semExpr c, dest, a, flags
     # make sure template body expression matches return type, mirrored with `semProcBody`:
     let returnType =
       if m.inferred.len == 0 or m.returnType.kind == DotToken:
@@ -816,6 +818,26 @@ proc runCompiledMacroPlugin(c: var SemContext; dest: var TokenBuf; it: var Item;
   else:
     buildErr c, dest, cs.callNode.info, "macro '" & pool.syms[finalFn] & "' not compiled"
 
+proc inferTypevarsFromExpected(c: var SemContext; m: var Match; expected: TypeCursor) =
+  ## When argument matching leaves a generic routine's typevars unbound but the
+  ## call site has a concrete expected type, unify the routine's return type with
+  ## it to bind the rest — e.g. `let r: Result[int, string] = ok(5)` infers `E`
+  ## from the target even though only `T` appears in `ok`'s argument. Runs after
+  ## overload selection, so it cannot affect which candidate is chosen; it only
+  ## fills in bindings before `buildTypeArgs` checks they are all present. Merges
+  ## only on a clean (non-converting) unify, so a conversion-to-expected (handled
+  ## later by `commonType`) is left untouched.
+  if m.err or m.fn.kind notin RoutineKinds or m.fn.sym == SymId(0): return
+  if cursorIsNil(expected) or expected.kind == DotToken or
+     expected.typeKind in {AutoT, VoidT} or containsGenericParams(expected): return
+  if cursorIsNil(m.returnType) or m.returnType.kind == DotToken: return
+  var rtMatch = createMatch(addr c)
+  rtMatch.inferred = m.inferred  # seed with the bindings already found from args
+  var rt = m.returnType
+  typematch(rtMatch, rt, Item(n: emptyNode(c), typ: expected))
+  if not rtMatch.err and classifyMatch(rtMatch) in {EqualMatch, GenericMatch}:
+    m.inferred = rtMatch.inferred
+
 proc resolveOverloads(c: var SemContext; dest: var TokenBuf; it: var Item; cs: var CallState) =
   let genericArgs =
     if cs.hasGenericArgs: cursorAt(cs.genericDest, 0)
@@ -978,6 +1000,8 @@ proc resolveOverloads(c: var SemContext; dest: var TokenBuf; it: var Item; cs: v
         compatBundleVarargsInMatch c, m[idx], varargsElem, cs.callNode.info
     addArgsInstConverters(c, dest, m[idx], cs.args)
     takeParRi dest, it.n
+    if m[idx].hasUnboundTypevars:
+      inferTypevarsFromExpected(c, m[idx], it.typ)
     buildTypeArgs(m[idx])
 
     if m[idx].err:
@@ -996,7 +1020,7 @@ proc resolveOverloads(c: var SemContext; dest: var TokenBuf; it: var Item; cs: v
         c.expanded.addSymUse finalFn.sym, cs.callNode.info
         inc c.templateInstCounter
         withErrorContext c, cs.callNode.info:
-          semTemplateCall c, dest, it, finalFn.sym, cs.beforeCall, m[idx]
+          semTemplateCall c, dest, it, finalFn.sym, cs.beforeCall, m[idx], cs.flags
         dec c.templateInstCounter
       else:
         buildErr c, dest, cs.callNode.info, "recursion limit exceeded for template expansions"

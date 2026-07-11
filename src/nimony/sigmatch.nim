@@ -10,7 +10,7 @@ include ".." / lib / nifprelude
 include ".." / lib / compat2
 
 import nimony_model, decls, programs, semdata, typeprops, xints, builtintypes, renderer, asthelpers,
-  features, symtabs, sigconcepts
+  features, symtabs, sigconcepts, expreval, staticmatches
 import ".." / lib / symparser
 import ".." / models / tags
 
@@ -480,17 +480,204 @@ proc matchesConstraint*(m: var Match; f: var Cursor; a: Cursor): bool =
   if a.kind == Symbol:
     let res = tryLoadSym(a.symId)
     assert res.status == LacksNothing
-    if res.decl.symKind == TypevarY:
+    if isTypevarLike(res.decl.symKind):
+      # for a value parameter its element type stands in for its "type"
       var typevar = asTypevar(res.decl)
       return matchesConstraint(m, f, typevar.typ)
   result = matchesConstraintAux(m, f, a)
+
+proc foldValueExpr(m: var Match; a: Cursor; depth = 0): xint =
+  ## The tiny fixed-opcode evaluator for compile-time *values* in type
+  ## positions: folds `+ - *` over integer literals and rewrites an
+  ## array-index `rangetype` to its length. Anything else — in particular a
+  ## still-symbolic expression — yields NaN and is compared syntactically
+  ## instead; matching never solves for a value parameter backwards.
+  result = createNaN()
+  if depth > 10: return
+  case a.kind
+  of IntLit:
+    result = createXint(pool.integers[a.intId])
+  of UIntLit:
+    result = createXint(pool.uintegers[a.uintId])
+  of Symbol:
+    # an already-inferred value typevar (e.g. `R` in `array[R * C, T]`): fold to
+    # the value it was bound to, so array-length matching resolves once bound.
+    if isStaticTypevar(a.symId) and m.inferred.contains(a.symId):
+      let inferred = m.inferred.getOrQuit(a.symId)
+      result = foldValueExpr(m, inferred, depth+1)
+  of ParLe:
+    case a.exprKind
+    of AddX, SubX, MulX:
+      let opc = a.exprKind
+      var n = a
+      inc n # tag
+      if n.typeKind notin {IntT, UIntT}: return
+      skip n # type
+      let x = foldValueExpr(m, n, depth+1)
+      if x.isNaN: return
+      skip n
+      let y = foldValueExpr(m, n, depth+1)
+      if y.isNaN: return
+      case opc
+      of AddX: result = x + y
+      of SubX: result = x - y
+      else: result = x * y
+    of SufX:
+      var n = a
+      inc n
+      result = foldValueExpr(m, n, depth+1)
+    else:
+      if a.typeKind == RangetypeT and m.context != nil:
+        result = lengthOrd(m.context[], a)
+  else:
+    discard
+
+proc foldStaticArg(m: var Match; elemType, a: Cursor): Cursor =
+  ## Fold `a` to the canonical typed value a value (`static`) parameter should
+  ## bind, using the shared `expreval` engine in a mode that never shells out
+  ## to a sub-compile (overload resolution must stay in-process and cheap).
+  ## `annotateConstantType` re-types the folded value against `elemType`, so an
+  ## enum-valued `const` recovers its field symbol instead of collapsing to a
+  ## bare ordinal (which would drop the enum type). Returns `default(Cursor)`
+  ## when `a` cannot be folded locally or does not match `elemType`.
+  result = default(Cursor)
+  if m.context == nil: return
+  var ec = initEvalContext(m.context, noExecute = true)
+  var cur = a
+  let folded = eval(ec, cur)
+  if folded.kind == ParLe and folded.tagId == nifstreams.ErrT:
+    return
+  # `folded` lives in a temporary buffer; consume it immediately by re-typing
+  # it into a fresh buffer before any other evaluation runs.
+  var buf = createTokenBuf(16)
+  annotateConstantType(buf, elemType, folded)
+  let typed = cursorAt(buf, 0)
+  if typed.kind == ParLe and typed.tagId == nifstreams.ErrT:
+    return
+  result = typeToCursor(m.context[], buf, 0)
+
+proc isEnumFieldSym(a: Cursor): bool =
+  if a.kind != Symbol: return false
+  let res = tryLoadSym(a.symId)
+  result = res.status == LacksNothing and res.decl.symKind == EfldY
+
+proc staticValueToBind(m: var Match; elemType: Cursor; a: Cursor): Cursor =
+  ## For a value (`static`) generic parameter: the value to bind from `a`, or
+  ## `default(Cursor)` when `a` is not an acceptable argument. An array-index
+  ## `rangetype` is rewritten to its length, so `N` binds `3` when `array[N, T]`
+  ## is matched against an `array[3, T]`. Binding only happens from such bare
+  ## positions; a value is never solved backwards out of arithmetic.
+  result = default(Cursor)
+  let k = elemType.typeKind
+  case a.kind
+  of IntLit:
+    if k in {IntT, UIntT}: result = a
+  of UIntLit:
+    if k in {UIntT, IntT}: result = a
+  of FloatLit:
+    if k == FloatT: result = a
+  of CharLit:
+    if k == CharT: result = a
+  of StringLit:
+    if m.context != nil and sameTrees(elemType, m.context.types.stringType):
+      result = a
+  of Symbol:
+    if isStaticTypevar(a.symId):
+      # a symbolic value: a value parameter of an enclosing generic; it is
+      # compared or substituted later, no value is computed here
+      result = a
+    elif isEnumFieldSym(a) and isOrdinalType(elemType, allowEnumWithHoles = true):
+      # an enum field is already the canonical typed value of its enum type;
+      # bind it verbatim (folding to the bare ordinal would lose the type)
+      result = a
+    else:
+      # a `const` (or other foldable symbol): resolve it through the shared
+      # expreval engine and bind the value it aliases, exactly as if that value
+      # had been written in the argument position.
+      result = foldStaticArg(m, elemType, a)
+  of ParLe:
+    case a.exprKind
+    of FalseX, TrueX:
+      if k == BoolT: result = a
+    of SufX:
+      var inner = a
+      inc inner
+      case inner.kind
+      of IntLit, UIntLit:
+        if k in {IntT, UIntT}: result = a
+      of FloatLit:
+        if k == FloatT: result = a
+      else: discard
+    else:
+      if isStaticValue(a) and staticValueTypeMatches(elemType, staticValueType(a)):
+        # a typed aggregate constructor (array/set/tuple/object), or an
+        # `openArray`/`varargs` value satisfied by an array literal
+        result = a
+      elif isStaticValue(a) and elemType.typeKind == InvokeT:
+        # a *dependent* generic element type such as `Shape[N]`, where an
+        # enclosing value parameter `N` parameterizes this parameter's type.
+        # Unify the element type against the value's concrete type (`Shape[2]`),
+        # which binds or equality-checks the enclosing parameters through the
+        # ordinary matcher. See #2108 / issue #2104.
+        let vt = staticValueType(a)
+        if not cursorIsNil(vt):
+          var f = elemType
+          var av = vt
+          if tryLinearMatch(m, f, av):
+            result = a
+      elif containsGenericParams(a):
+        # a symbolic expression over value parameters, e.g. `N1 + N2`:
+        # compared syntactically, never solved
+        result = a
+      elif k in {IntT, UIntT} and m.context != nil:
+        # a concrete value expression (an array-index `rangetype` or fully
+        # substituted arithmetic like `2 * 3`): fold it and bind the value
+        let v = foldValueExpr(m, a)
+        var err = false
+        let vv = asSigned(v, err)
+        if not (err or v.isNaN):
+          var buf = createTokenBuf(2)
+          buf.addIntLit(vv, a.info)
+          result = typeToCursor(m.context[], buf, 0)
+  else:
+    discard
+
+proc bindStaticTypevar(m: var Match; fs: SymId; elemType: Cursor; a: Cursor): bool =
+  ## Bind or check a value (`static`) generic parameter against the value `a`:
+  ## bind from a bare position; a repeated parameter is an equality check.
+  let av = staticValueToBind(m, elemType, a)
+  if av == default(Cursor):
+    return false
+  if m.concreteMatch:
+    return true
+  if m.inferred.contains(fs):
+    let prev = m.inferred.getOrQuit(fs)
+    if sameTrees(prev, av):
+      return true
+    # both concrete? then compare the folded values
+    let pv = foldValueExpr(m, prev)
+    if pv.isNaN: return false
+    let av2 = foldValueExpr(m, av)
+    return not av2.isNaN and pv == av2
+  m.inferred[fs] = av
+  return true
+
+proc bindStaticTypevar(m: var Match; fs: SymId; a: Cursor): bool =
+  let res = tryLoadSym(fs)
+  assert res.status == LacksNothing
+  result = bindStaticTypevar(m, fs, asTypevar(res.decl).typ, a)
 
 proc matchesConstraint(m: var Match; f: SymId; a: Cursor): bool =
   let res = tryLoadSym(f)
   assert res.status == LacksNothing
   var typevar = asTypevar(res.decl)
-  assert typevar.kind == TypevarY
-  result = matchesConstraint(m, typevar.typ, a)
+  if typevar.kind == StaticTypevarY:
+    # for a value parameter "matching the constraint" means: `a` is an
+    # acceptable *value* of the declared element type
+    result = staticValueToBind(m, typevar.typ, a) != default(Cursor)
+  else:
+    assert typevar.kind == TypevarY
+    result = matchesConstraint(m, typevar.typ, a)
 
 proc conceptReturnTypesMatch(m: var Match; cRet, aRet: Cursor): bool =
   var c = cRet
@@ -686,7 +873,7 @@ proc isTypevar(s: SymId): bool =
   let res = tryLoadSym(s)
   assert res.status == LacksNothing
   let typevar = asTypevar(res.decl)
-  result = typevar.kind == TypevarY
+  result = isTypevarLike(typevar.kind)
 
 proc cmpTypeBits(context: ptr SemContext; f, a: Cursor): int =
   if (f.kind == IntLit or f.kind == InlineInt) and
@@ -765,6 +952,19 @@ proc rematchInferredTypevar(m: var Match; fs: SymId; prev: Cursor;
   ## from an earlier parameter. A scalar typevar binding (e.g. `T` from
   ## `Complex[T]`) must not be widened via concept constraints to accept
   ## a generic constructor over the same variable (`Complex[T]`).
+  let pv = foldValueExpr(m, prev)
+  if not pv.isNaN:
+    # the previous binding is a concrete compile-time *value* (e.g. a
+    # substituted `2 * 2` recorded for an explicit instantiation): compare
+    # folded values, so it also matches the already folded index type `0..3`
+    let av = foldValueExpr(m, a)
+    if not av.isNaN:
+      if pv == av:
+        inc f
+        skip a
+      else:
+        m.errorTypevar InvalidRematch, prev, a, fs
+      return
   if prev.kind == Symbol and isTypevar(prev.symId) and a.typeKind == InvokeT:
     m.errorTypevar InvalidRematch, prev, a, fs
   elif prev.kind == Symbol and isTypevar(prev.symId) and sameTrees(prev, a):
@@ -785,7 +985,16 @@ proc linearMatch(m: var Match; f, a: var Cursor; flags: set[LinearMatchFlag] = {
     if f.kind == Symbol and isTypevar(f.symId):
       # type vars are specal:
       let fs = f.symId
-      if m.concreteMatch:
+      if isStaticTypevar(fs):
+        # a value parameter: bind from a bare position; a repeated
+        # parameter is an equality check
+        if bindStaticTypevar(m, fs, a):
+          inc f
+          skip a
+        else:
+          m.error(ConstraintMismatch, f, a)
+          break
+      elif m.concreteMatch:
         # generic param is from provided argument type
         # instead of considering inference, treat as a standalone value
         if matchesConstraint(m, fs, a):
@@ -1032,10 +1241,14 @@ proc procTypeMatch(m: var Match; f, a: var Cursor) =
     m.error CallConvMismatch, f, a
   elif fcc.usesRaises != acc.usesRaises:
     m.error RaisesMismatch, f, a
-  elif fcc.usesClosure != acc.usesClosure:
+  elif (fcc.usesClosure != acc.usesClosure) and (not fcc.usesClosure or acc.cc != Nimcall):
     m.error ClosureMismatch, f, a
   elif fcc.usesPassive != acc.usesPassive:
     m.error PassiveMismatch, f, a
+  if not m.err and fcc.usesClosure and not acc.usesClosure:
+    m.args.addParLe ToClosureX, m.argInfo
+    inc m.opened
+    inc m.convCosts
   # XXX consider when f or a is (params):
   if not fIsProctype:
     skip f, SkipEffects # effects
@@ -1183,16 +1396,16 @@ proc procTypeOfRoutineSym(sym: SymId; buf: var TokenBuf): bool =
   ## Build the structural proc type of a routine symbol into `buf` so it can be
   ## compared against a formal proc type with `procTypeMatch`.
   let res = tryLoadSym(sym)
-  if res.status != LacksNothing: return false
-  if res.decl.symKind notin RoutineKinds: return false
-  let r = asRoutine(res.decl)
-  buf.addParLe ProctypeT
-  buf.addDotToken() # nilability tag
-  buf.addSubtree r.params
-  buf.addSubtree r.retType
-  buf.addSubtree r.pragmas
-  buf.addParRi()
-  result = true
+  result = false
+  if res.status == LacksNothing and res.decl.symKind in RoutineKinds:
+    let r = asRoutine(res.decl)
+    buf.addParLe ProctypeT
+    buf.addDotToken() # nilability tag
+    buf.addSubtree r.params
+    buf.addSubtree r.retType
+    buf.addSubtree r.pragmas
+    buf.addParRi()
+    result = true
 
 proc tryMatchProcChoice*(context: ptr SemContext; choice, f: Cursor): SymId =
   ## Find the unique overload in the OchoiceX/CchoiceX `choice` whose proc type
@@ -1214,7 +1427,7 @@ proc tryMatchProcChoice*(context: ptr SemContext; choice, f: Cursor): SymId =
           if not trial.err:
             result = a.symId
             inc matchCount
-    inc a
+    skip a
   if matchCount != 1:
     result = SymId(0)
 
@@ -1222,7 +1435,10 @@ proc matchSymbol(m: var Match; f: Cursor; arg: CallArg) =
   let a = skipModifier(arg.typ)
   let fs = f.symId
   if isTypevar(fs):
-    if m.concreteMatch:
+    if isStaticTypevar(fs):
+      # a value parameter is not a type; it cannot be a parameter's type
+      m.error InvalidMatch, f, a
+    elif m.concreteMatch:
       # generic param is from provided argument type
       # instead of considering inference, treat as a standalone value
       if not matchesConstraint(m, fs, a):
@@ -1375,8 +1591,14 @@ proc matchArrayType(m: var Match; f: var Cursor; a: var Cursor) =
     inc f1
     skip a1
     skip f1
-    let fLen = lengthOrd(m.context[], f1)
-    let aLen = lengthOrd(m.context[], a1)
+    # fold already-bound value typevars first (`array[R * C, T]`), falling back
+    # to the plain array-length ordinal for concrete/rangetype lengths.
+    var fLen = foldValueExpr(m, f1)
+    if fLen.isNaN:
+      fLen = lengthOrd(m.context[], f1)
+    var aLen = foldValueExpr(m, a1)
+    if aLen.isNaN:
+      aLen = lengthOrd(m.context[], a1)
     if fLen.isNaN or aLen.isNaN:
       # match typevars
       linearMatch m, f, a
@@ -1553,15 +1775,25 @@ proc singleArgImpl(m: var Match; f: var Cursor; arg: CallArg) =
         # handled in linearMatch
         linearMatch m, f, a
     of RangetypeT:
-      # for now acts the same as base type
+      # A `range[lo..hi]` matches structurally on its *base type* only; whether
+      # a value actually fits the bounds (and whether one range is a subset of
+      # another) is a proof obligation discharged later by the contracts engine
+      # (see `checkRangeAssign` in contracts_njvl.nim), not a type-match failure
+      # here. This deliberately accepts legal narrowings such as
+      # `range[2..5]` -> `range[0..10]` that an exact-tree match would reject.
       var a = skipModifier(arg.typ)
       if a.typeKind == RangetypeT:
-        linearMatch m, f, a
+        var fb = f
+        var ab = a
+        inc fb # -> formal base type
+        inc ab # -> arg base type
+        linearMatch m, fb, ab # base types must be compatible
+        skip f # consume the whole formal range type
       else:
         inc f # skip to base type
         linearMatch m, f, a
-        skip f
-        skip f
+        skip f # lo bound
+        skip f # hi bound
         expectParRi m, f
     of ArrayT:
       var a = skipModifier(arg.typ)
@@ -2062,7 +2294,7 @@ iterator typeVars(fn: SymId): SymId {.sideEffect.} =
     if c.substructureKind == TypevarsU:
       inc c
       while c.hasMore:
-        if c.symKind == TypevarY:
+        if isTypevarLike(c.symKind):
           var tv = c
           inc tv
           yield tv.symId
@@ -2090,12 +2322,16 @@ proc matchTypevars*(m: var Match; fn: FnCandidate; explicitTypeVars: Cursor) =
         m.error0Typevar MissingExplicitGenericParameter, v
         break
       else:
-        if matchesConstraint(m, v, e):
+        let res = tryLoadSym(v)
+        assert res.status == LacksNothing
+        var typevar = asTypevar(res.decl)
+        if typevar.kind == StaticTypevarY:
+          # explicitly given value for a value parameter, e.g. `Matrix[3, 4, int]`
+          if not bindStaticTypevar(m, v, typevar.typ, e):
+            m.error ConstraintMismatch, typevar.typ, e
+        elif matchesConstraint(m, v, e):
           m.inferred[v] = e
         else:
-          let res = tryLoadSym(v)
-          assert res.status == LacksNothing
-          var typevar = asTypevar(res.decl)
           assert typevar.kind == TypevarY
           m.error ConstraintMismatch, typevar.typ, e
         skip e
@@ -2133,6 +2369,15 @@ proc sigmatch*(m: var Match; fn: FnCandidate; args: openArray[CallArg];
   if f.kind == ParRi:
     inc f
     m.returnType = f # return type follows the parameters in the token stream
+
+proc hasUnboundTypevars*(m: Match): bool =
+  ## True if `m.fn`'s generic typevars (as collected by `matchTypevars`) still
+  ## lack a binding after argument matching. Cheap: just consults the
+  ## `tvars`/`inferred` bookkeeping already built up, no extra lookups.
+  for v in m.tvars:
+    if not m.inferred.hasKey(v):
+      return true
+  return false
 
 proc buildTypeArgs*(m: var Match) =
   # check all type vars have a value:
