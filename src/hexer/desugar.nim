@@ -86,7 +86,7 @@ proc needsTemp(n: Cursor): bool =
         XorsetX, EqsetX, LesetX, LtsetX, InsetX, CardX, EmoveX,
         DestroyX, DupX, CopyX, WasmovedX, SinkhX, TraceX,
         InternalTypeNameX, InternalFieldPairsX, FailedX, IsX,
-        EnvpX, KvX, NoExpr:
+        EnvpX, KvX, ToClosureX, NoExpr:
       result = true
   else:
     result = true
@@ -1001,7 +1001,7 @@ proc tr(c: var Context; dest: var TokenBuf; n: var Cursor; isTopScope = false) =
                 takeTree dest, n # keep set constructor
                 tr(c, dest, n)
             of NilU, NotnilU, KvU, VvU, RangeU, RangesU, ParamU,
-                TypevarU, EfldU, FldU, WhenU, ElifU, ElseU,
+                TypevarU, StaticTypevarU, EfldU, FldU, WhenU, ElifU, ElseU,
                 TypevarsU, CaseU, StmtsU, ParamsU, PragmasU,
                 EitherU, JoinU, UnpackflatU, UnpacktupU, ExceptU,
                 FinU, UncheckedU, GfldU, CallargsU, ForcallU, NoSub:
@@ -1088,7 +1088,7 @@ proc tr(c: var Context; dest: var TokenBuf; n: var Cursor; isTopScope = false) =
         Delay0X, SuspendX, DoX, TupatX, EmoveX,
         DestroyX, DupX, CopyX, WasmovedX, SinkhX, TraceX,
         InternalTypeNameX, InternalFieldPairsX, FailedX, IsX,
-        EnvpX, KvX:
+        EnvpX, KvX, ToClosureX:
       trSons(c, dest, n)
   of ParRi:
     bug "unexpected ')' inside"
