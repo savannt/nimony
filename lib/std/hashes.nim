@@ -28,10 +28,14 @@ when not defined(nimony):
   func hash*(x: int): Hash {.inline.} = cast[Hash](x)
 
 func hash*(x: int64): Hash {.inline.} = cast[Hash](x)
-func hash*(x: uint64): Hash {.inline.} = cast[Hash](x)
-  ## On a 32-bit target `Hash`/`uint` is 32-bit while `uint64` is not, so a
-  ## dedicated overload is needed (mirrors `hash(int64)`); on 64-bit it is
-  ## redundant with `hash(uint)` but harmless.
+when not defined(cpu64):
+  func hash*(x: uint64): Hash {.inline.} = cast[Hash](x)
+    ## On a 32-bit target `Hash`/`uint` is 32-bit while `uint64` is not, so a
+    ## dedicated overload is needed (mirrors `hash(int64)`). On a 64-bit target
+    ## `uint` already IS 64-bit, so this overload is redundant with `hash(uint)`
+    ## and — because neither is an exact match for a `distinct uint32` borrow
+    ## (lineinfos.FileId/PackedLineInfo) or a generic `hash(v: T)` (bitabs) —
+    ## it makes those calls ambiguous. So only define it off the 64-bit build.
 func hash*(x: int32): Hash {.inline.} = cast[Hash](int x)
 func hash*(x: char): Hash {.inline.} = Hash(x)
 func hash*(x: bool): Hash {.inline.} = Hash(x)
