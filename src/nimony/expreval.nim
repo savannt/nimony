@@ -1511,7 +1511,7 @@ proc evalBitSetImpl(n, typ: Cursor): seq[uint8] =
   let s = asSigned(size, err)
   if err:
     return @[]
-  result = newSeq[uint8](s)
+  result = newSeq[uint8](int(s))
   var n = n
   inc n # skip set tag
   skip n # skip set type
@@ -1527,7 +1527,7 @@ proc evalBitSetImpl(n, typ: Cursor): seq[uint8] =
         var i = asUnsigned(xa, err)
         let zb = asUnsigned(xb, err)
         while i <= zb:
-          result[i shr 3] = result[i shr 3] or (1'u8 shl (i.uint8 and 7'u8))
+          result[int(i shr 3)] = result[int(i shr 3)] or (1'u8 shl (i.uint8 and 7'u8))
           inc i
       else:
         err = true
@@ -1536,7 +1536,7 @@ proc evalBitSetImpl(n, typ: Cursor): seq[uint8] =
       skip n
       if not xa.isNaN:
         let i = asUnsigned(xa, err)
-        result[i shr 3] = result[i shr 3] or (1'u8 shl (i.uint8 and 7'u8))
+        result[int(i shr 3)] = result[int(i shr 3)] or (1'u8 shl (i.uint8 and 7'u8))
       else:
         err = true
   if err:
