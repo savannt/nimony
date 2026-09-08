@@ -129,6 +129,11 @@ proc createLiterals(data: openArray[(string, int)]): Literals =
 
 var pool* = createLiterals(TagData)
 
+proc initializeNifStreams*() =
+  ## Shared libraries do not currently execute module-level initializers. Hosts
+  ## embedding the NIF reader call this once before parsing their first file.
+  pool = createLiterals(TagData)
+
 proc identToken*(s: StrId; info: PackedLineInfo): PackedToken {.inline.} =
   toToken(Ident, s, info)
 
