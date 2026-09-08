@@ -929,6 +929,7 @@ proc parseFromBuffer*(input: string; thisModule: sink string; sizeHint = 100): T
 
 proc parseFromFile*(filename: string; sizeHint = 100): TokenBuf =
   var r = nifstreams.open(filename)
+  defer: nifstreams.close(r)
   discard processDirectives(r.r)
   result = createTokenBuf(sizeHint)
   parse(r, result, NoLineInfo)
